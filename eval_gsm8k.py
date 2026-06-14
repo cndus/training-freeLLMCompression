@@ -74,7 +74,25 @@ def call_calc(calc_url: str, expression: str) -> str:
 
 
 # ── Context compression ───────────────────────────────────────────────────────
+COMPRESS_PROMPT2 = '''
+You are a Working Memory Manager for a math agent. Your ONLY task is to compress the reasoning history into a highly concise memory state. 
+You are NOT the problem solver. DO NOT solve the next step. DO NOT output the final answer.
 
+[Original Question]: 
+{question}
+
+[Previous history]: 
+{history}
+
+[Calculator Result]: 
+{calc_result}
+
+INSTRUCTIONS:
+Merge the [Previous history] and the [Calculator Result] into an updated Working Memory.
+1. Output exactly 2 to 3 bullet points.
+2. The bullets must contain ONLY explicit numbers, established facts, and what the latest calculation yielded.
+3. STRICT RESTRICTIONS: Keep it strictly under 40 words total. Do NOT use `<think>` tags. Do NOT suggest what to do next.
+'''
 COMPRESS_PROMPT = """\
 Math problem in progress. Summarize the reasoning so far in 2-3 sentences, \
 incorporating the calculator result below. State only the key numbers found \
@@ -85,33 +103,59 @@ Calculator result: {calc_result}
 Conversation so far:
 {history}"""
 
+# ── Math agent prompts ────────────────────────────────────────────────────────
 
-def compress_context(client, model: str, messages: List[Dict], calc_result: str) -> str:
-    # Only pass the last assistant response (truncated to 500 chars) to keep prompt short
+# Turn 1: no working memory yet
+MATH_PROMPT_INIT = """\
+You are an efficient mathematical problem solver.
+You are given a [Question]. Solve it step-by-step.
+
+RULES:
+1. CRITICAL: Your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not re-explain the whole problem.
+2. After thinking, you MUST choose EXACTLY ONE of the following two actions:
+   - Option A (Needs Calculation): If you need to compute something, output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
+   - Option B (Final Answer Reached): If you already know the final answer, output the final numerical value enclosed in `<answer>...</answer>`.
+
+[Question]:
+{question}
+
+Now, generate your next step:"""
+
+# Turn 2+: has working memory from previous compression
+MATH_PROMPT_WITH_MEMORY = """\
+You are an efficient mathematical problem solver.
+You are given a [Question] and your [Current Working Memory] which contains the summarized results of your previous steps.
+
+Your goal is to solve the problem step-by-step.
+
+RULES:
+1. CRITICAL: To remain efficient, your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not re-explain the whole problem.
+2. After thinking, you MUST choose EXACTLY ONE of the following two actions:
+   - Option A (Needs Calculation): If you need to compute something, output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
+   - Option B (Final Answer Reached): If you already know the final answer based on the memory, output the final numerical value enclosed in `<answer>...</answer>`.
+
+[Question]:
+{question}
+
+[Current Working Memory]:
+{working_memory}
+
+Now, generate your next step:"""
+
+
+def compress_context(client, model: str, messages: List[Dict], calc_result: str, question: str) -> str:
     last_asst = next(
         (m["content"] for m in reversed(messages) if m["role"] == "assistant"), ""
     )
     last_asst_short = last_asst[:500] + ("..." if len(last_asst) > 500 else "")
     history = f"[ASSISTANT]: {last_asst_short}"
     raw = call_api(client, [{"role": "user", "content":
-                              COMPRESS_PROMPT.format(history=history, calc_result=calc_result)}], model)
-    # extract only the last <think>...</think> block if present, else use raw
+                              COMPRESS_PROMPT2.format(history=history, calc_result=calc_result,
+                                                      question=question)}], model)
     think_blocks = re.findall(r'<think>(.*?)</think>', raw, re.DOTALL)
     if think_blocks:
-        return "<think>\n" + think_blocks[-1].strip() + "\n</think>"
-    # fallback: strip to first 300 chars if no think block (avoid bloat)
+        return think_blocks[-1].strip()
     return raw.strip()[:300]
-
-
-# ── Prompt patching ───────────────────────────────────────────────────────────
-
-def patch_prompt(prompt: str) -> str:
-    """Replace <search> tags with <calculate> tags in the prompt text."""
-    prompt = re.sub(r'<search>', '<calculate>', prompt)
-    prompt = re.sub(r'</search>', '</calculate>', prompt)
-    prompt = re.sub(r'call a search engine by', 'call the calculator by', prompt)
-    prompt = re.sub(r'You can search as many times as your want\.', '', prompt)
-    return prompt
 
 
 INVALID_MSG = (
@@ -120,21 +164,22 @@ INVALID_MSG = (
     "If you have the final answer, wrap it in <answer> and </answer>.\n"
 )
 
-
-# ── Single-sample generation loop ─────────────────────────────────────────────
-
-def run_single(client, model: str, calc_url: str, prompt: str, max_turns: int) -> Dict:
-    original_prompt = prompt
-    messages = [{"role": "user", "content": prompt}]
-    # turn_data: list of {response, calc_query, calc_result, compression, context_chars}
+def run_single(client, model: str, calc_url: str, question: str, max_turns: int) -> Dict:
+    working_memory = None  # None on turn 1, set after each compression
     turn_data = []
     num_turns = 0
     compressions = 0
 
     for turn in range(max_turns + 1):
-        context_chars = sum(len(m["content"]) for m in messages)
+        # build fresh single-turn prompt each round
+        if working_memory is None:
+            prompt = MATH_PROMPT_INIT.format(question=question)
+        else:
+            prompt = MATH_PROMPT_WITH_MEMORY.format(question=question, working_memory=working_memory)
+
+        messages = [{"role": "user", "content": prompt}]
+        context_chars = len(prompt)
         response = call_api(client, messages, model, stop=["</calculate>", "</answer>"])
-        messages.append({"role": "assistant", "content": response})
 
         td = {
             "response": response,
@@ -153,23 +198,46 @@ def run_single(client, model: str, calc_url: str, prompt: str, max_turns: int) -
         if calc_match and turn < max_turns:
             query = calc_match.group(1).strip()
             result = call_calc(calc_url, query)
-            compressed = compress_context(client, model, messages, result)
+            compressed = compress_context(
+                client, model,
+                [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}],
+                result, question
+            )
             compressions += 1
             td["calc_query"] = query
             td["calc_result"] = result
             td["compression"] = compressed
-            messages = [
-                {"role": "user", "content": original_prompt},
-                {"role": "assistant", "content": compressed},
-            ]
+            working_memory = compressed
         elif turn < max_turns:
-            messages.append({"role": "user", "content": INVALID_MSG})
+            # nudge with INVALID_MSG in same turn, don't consume a full turn slot
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": response},
+                {"role": "user", "content": INVALID_MSG},
+            ]
+            retry = call_api(client, messages, model, stop=["</calculate>", "</answer>"])
+            td["response"] = response + "\n[retry]\n" + retry
+            if re.search(r'<answer>.*?</answer>', retry, re.DOTALL):
+                turn_data.append(td)
+                break
+            calc_match2 = re.search(r'<calculate>(.*?)</calculate>', retry, re.DOTALL)
+            if calc_match2 and turn < max_turns:
+                query = calc_match2.group(1).strip()
+                result = call_calc(calc_url, query)
+                compressed = compress_context(
+                    client, model,
+                    [{"role": "user", "content": prompt}, {"role": "assistant", "content": retry}],
+                    result, question
+                )
+                compressions += 1
+                td["calc_query"] = query
+                td["calc_result"] = result
+                td["compression"] = compressed
+                working_memory = compressed
 
         turn_data.append(td)
 
-    last_asst = next(
-        (m["content"] for m in reversed(messages) if m["role"] == "assistant"), ""
-    )
+    last_asst = turn_data[-1]["response"] if turn_data else ""
     return {
         "last_assistant": last_asst,
         "num_turns": num_turns,
@@ -270,14 +338,13 @@ def main():
             if idx in done_indices:
                 continue
 
-            raw_prompt = row["prompt"][0]["content"]
-            prompt = patch_prompt(raw_prompt)
-            question = extract_question(raw_prompt)
+            # use raw 'question' field directly, build prompt inside run_single
+            question = row["question"].strip()
             ground_truth = row["reward_model"]["ground_truth"]
 
             for attempt in range(5):
                 try:
-                    stats = run_single(client, args.model, args.calc_url, prompt, args.max_turns)
+                    stats = run_single(client, args.model, args.calc_url, question, args.max_turns)
                     break
                 except Exception as e:
                     print(f"  [#{idx}] error attempt {attempt+1}: {e}")
