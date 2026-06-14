@@ -16,6 +16,5 @@ python eval_gsm8k.py \
     --data_path ../Search-R1/data/gsm8k_calc/test.parquet \
     --calc_url http://192.168.102.16:8000/retrieve \
     --model qwen3.7-plus \
-    --num_samples 5 \
     --max_turns 3 \
     --output_dir ./results_qwen3_7plus

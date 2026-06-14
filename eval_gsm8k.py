@@ -5,6 +5,8 @@ Output: one CSV row per sample, columns = input, per-turn outputs, LLM compressi
 
 import re, os, json, csv, argparse, requests, time
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import pandas as pd
 from openai import OpenAI
 import sys
@@ -91,30 +93,24 @@ INSTRUCTIONS:
 Merge the [Previous history] and the [Calculator Result] into an updated Working Memory.
 1. Output exactly 2 to 3 bullet points.
 2. The bullets must contain ONLY explicit numbers, established facts, and what the latest calculation yielded.
-3. STRICT RESTRICTIONS: Keep it strictly under 40 words total. Do NOT use `<think>` tags. Do NOT suggest what to do next.
+3. STRICT RESTRICTIONS: Keep it strictly under 40 words total. Do NOT use `<think>` tags if possible. Direct output the bullet points.
+
+Working Memory:
 '''
-COMPRESS_PROMPT = """\
-Math problem in progress. Summarize the reasoning so far in 2-3 sentences, \
-incorporating the calculator result below. State only the key numbers found \
-and what remains to be computed. Be extremely concise.
 
-Calculator result: {calc_result}
-
-Conversation so far:
-{history}"""
 
 # ── Math agent prompts ────────────────────────────────────────────────────────
-
 # Turn 1: no working memory yet
 MATH_PROMPT_INIT = """\
 You are an efficient mathematical problem solver.
 You are given a [Question]. Solve it step-by-step.
 
 RULES:
-1. CRITICAL: Your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not re-explain the whole problem.
-2. After thinking, you MUST choose EXACTLY ONE of the following two actions:
-   - Option A (Needs Calculation): If you need to compute something, output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
-   - Option B (Final Answer Reached): If you already know the final answer, output the final numerical value enclosed in `<answer>...</answer>`.
+1. CRITICAL: Your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not re-explain the problem.
+2. NO DOUBLE-CHECKING: Trust your logic. Do not verify or double-check answers. Once you know the next step, act immediately.
+3. After thinking, you MUST choose EXACTLY ONE of the following two actions:
+   - Option A (Needs Calculation): Output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
+   - Option B (Final Answer Reached): Output ONLY the final numerical value enclosed in `<answer>...</answer>`.
 
 [Question]:
 {question}
@@ -129,10 +125,11 @@ You are given a [Question] and your [Current Working Memory] which contains the 
 Your goal is to solve the problem step-by-step.
 
 RULES:
-1. CRITICAL: To remain efficient, your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not re-explain the whole problem.
-2. After thinking, you MUST choose EXACTLY ONE of the following two actions:
-   - Option A (Needs Calculation): If you need to compute something, output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
-   - Option B (Final Answer Reached): If you already know the final answer based on the memory, output the final numerical value enclosed in `<answer>...</answer>`.
+1. CRITICAL: Your `<think>` process MUST be extremely concise (under 3 sentences or 50 words). Do not recount the whole history.
+2. NO DOUBLE-CHECKING: Trust the calculator and previous memory. Do not verify or double-check. 
+3. After thinking, you MUST choose EXACTLY ONE of the following two actions:
+   - Option A (Needs Calculation): Output EXACTLY ONE mathematical expression enclosed in `<calculate>...</calculate>`. DO NOT output anything else after this tag.
+   - Option B (Final Answer Reached): Output ONLY the final numerical value enclosed in `<answer>...</answer>`.
 
 [Question]:
 {question}
@@ -152,10 +149,12 @@ def compress_context(client, model: str, messages: List[Dict], calc_result: str,
     raw = call_api(client, [{"role": "user", "content":
                               COMPRESS_PROMPT2.format(history=history, calc_result=calc_result,
                                                       question=question)}], model)
-    think_blocks = re.findall(r'<think>(.*?)</think>', raw, re.DOTALL)
-    if think_blocks:
-        return think_blocks[-1].strip()
-    return raw.strip()[:300]
+    
+    # 修复：移除所有 <think>...</think> 内容，只保留真正的 summary
+    summary = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+    
+    # 兜底截断，防止异常生成
+    return summary[:300]
 
 
 INVALID_MSG = (
@@ -325,51 +324,62 @@ def main():
         done_indices = set(done_df["index"].tolist())
         print(f"Resuming: {len(done_indices)} samples already done")
 
-    write_header = not os.path.exists(csv_path)
+    # build work list
+    todo = []
+    for _, row in df.iterrows():
+        idx = int(row["extra_info"]["index"])
+        if idx not in done_indices:
+            todo.append((idx, row["question"].strip(), row["reward_model"]["ground_truth"]))
+
+    print(f"Remaining: {len(todo)} samples to evaluate")
+
+    write_lock = threading.Lock()
     results = []
+    write_header = not os.path.exists(csv_path)
+
+    def process_one(item):
+        idx, question, ground_truth = item
+        for attempt in range(5):
+            try:
+                stats = run_single(client, args.model, args.calc_url, question, args.max_turns)
+                break
+            except Exception as e:
+                print(f"  [#{idx}] error attempt {attempt+1}: {e}")
+                time.sleep(args.retry_delay * (attempt + 1))
+        else:
+            print(f"  [#{idx}] SKIPPED")
+            return None
+        score = compute_score_answer_tag(stats["last_assistant"], ground_truth)
+        return (idx, question, ground_truth, score, stats)
 
     with open(csv_path, "a", newline="", encoding="utf-8") as fout:
         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
         if write_header:
             writer.writeheader()
 
-        for _, row in df.iterrows():
-            idx = int(row["extra_info"]["index"])
-            if idx in done_indices:
-                continue
-
-            # use raw 'question' field directly, build prompt inside run_single
-            question = row["question"].strip()
-            ground_truth = row["reward_model"]["ground_truth"]
-
-            for attempt in range(5):
-                try:
-                    stats = run_single(client, args.model, args.calc_url, question, args.max_turns)
-                    break
-                except Exception as e:
-                    print(f"  [#{idx}] error attempt {attempt+1}: {e}")
-                    time.sleep(args.retry_delay * (attempt + 1))
-            else:
-                print(f"  [#{idx}] SKIPPED")
-                continue
-
-            score = compute_score_answer_tag(stats["last_assistant"], ground_truth)
-            results.append({
-                "correct": float(score > 0),
-                "num_turns": stats["num_turns"],
-                "compressions": stats["compressions"],
-                "avg_context_chars": stats["avg_context_chars"],
-            })
-
-            writer.writerow(build_row(idx, question, ground_truth, score, stats, args.max_turns))
-            fout.flush()
-
-            if len(results) % 50 == 0 or len(results) == 1:
-                acc = sum(r["correct"] for r in results) / len(results)
-                avg_t = sum(r["num_turns"] for r in results) / len(results)
-                avg_c = sum(r["compressions"] for r in results) / len(results)
-                print(f"  [{len(results)}/{len(df)}] acc={acc:.3f}  avg_turns={avg_t:.2f}"
-                      f"  avg_comp={avg_c:.2f}")
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(process_one, item): item for item in todo}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue
+                idx, question, ground_truth, score, stats = result
+                results.append({
+                    "correct": float(score > 0),
+                    "num_turns": stats["num_turns"],
+                    "compressions": stats["compressions"],
+                    "avg_context_chars": stats["avg_context_chars"],
+                })
+                with write_lock:
+                    writer.writerow(build_row(idx, question, ground_truth, score, stats, args.max_turns))
+                    fout.flush()
+                n_done = len(results)
+                if n_done % 50 == 0 or n_done == 1:
+                    acc = sum(r["correct"] for r in results) / n_done
+                    avg_t = sum(r["num_turns"] for r in results) / n_done
+                    avg_c = sum(r["compressions"] for r in results) / n_done
+                    print(f"  [{n_done}/{len(todo)}] acc={acc:.3f}  avg_turns={avg_t:.2f}"
+                          f"  avg_comp={avg_c:.2f}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     full = pd.read_csv(csv_path)
